@@ -13,14 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Check for libaio dependency (required)
-aio_dep = cpp.find_library('aio', required: false)
-
 # Try to find liburing (optional) - first try pkg-config
 uring_dep = dependency('liburing', required: false)
 plugin_deps = [nixl_infra, nixl_common_dep]
-
-paio = false
 
 # Define base source files - conditionally include uring_queue.cpp
 posix_sources = [
@@ -30,10 +25,6 @@ posix_sources = [
     'queue_factory_impl.cpp',
     'aio_queue.cpp'  # Always include AIO source since it's required
 ]
-
-if aio_dep.found()
-    paio = cpp.has_function('aio_cancel', prefix: '#include <aio.h>')
-endif
 
 # If libaio is not found, skip building the POSIX plugin entirely
 if aio_dep.found() and paio
