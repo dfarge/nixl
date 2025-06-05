@@ -75,32 +75,26 @@ namespace {
         }
     }
 
-    static nixlPosixQueue::queue_t getQueueType(const nixl_b_params_t* custom_params) {
+    static nixlPosixQueue::queue_t getQueueType(const nixl_b_params_t& queue_params) {
         using queue_t = nixlPosixQueue::queue_t;
 
-        // Check for explicit backend request
-        if (custom_params) {
-            // First check if AIO is explicitly requested
-            if (custom_params->count("use_aio") > 0) {
-                const auto& value = custom_params->at("use_aio");
-                if (value == "true" || value == "1") {
-                    return queue_t::AIO;
-                }
+        // First check if AIO is explicitly requested
+        if (queue_params.count("use_aio") > 0) {
+            const auto& value = queue_params.at("use_aio");
+            if (value == "true" || value == "1") {
+                return queue_t::AIO;
             }
+        }
 
-            // Then check if io_uring is explicitly requested
-            if (custom_params->count("use_uring") > 0) {
-                const auto& value = custom_params->at("use_uring");
-                if (value == "true" || value == "1") {
-#ifndef HAVE_LIBURING
+        // Then check if io_uring is explicitly requested
+        if (queue_params.count("use_uring") > 0) {
+            const auto& value = queue_params.at("use_uring");
+            if (value == "true" || value == "1") {
+                if (QueueFactory::isUringAvailable()) {
+                    return queue_t::URING;
+                } else {
                     NIXL_ERROR << "io_uring backend requested but not available - not built with liburing support";
                     return queue_t::UNSUPPORTED;
-#endif
-                    if (!QueueFactory::isUringAvailable()) {
-                        NIXL_ERROR << "io_uring backend requested but not available at runtime";
-                        return queue_t::URING;
-                    }
-                    return queue_t::URING;
                 }
             }
         }
@@ -115,15 +109,13 @@ namespace {
 nixlPosixBackendReqH::nixlPosixBackendReqH(const nixl_xfer_op_t &op,
                                            const nixl_meta_dlist_t &loc,
                                            const nixl_meta_dlist_t &rem,
-                                           const nixl_opt_b_args_t* args,
-                                           const nixl_b_params_t* params)
+                                           const nixl_b_params_t& custom_params)
     : operation(op)
     , local(loc)
     , remote(rem)
-    , opt_args(args)
-    , custom_params_(params)
+    , custom_params_(custom_params)
     , queue_depth_(loc.descCount())
-    , queue_type_(getQueueType(params)) {
+    , queue_type_(getQueueType(custom_params)) {
     if (queue_type_ == nixlPosixQueue::queue_t::UNSUPPORTED) {
         throw exception(
             absl::StrFormat("Unsupported backend type: %s", queue_type_),
@@ -152,7 +144,7 @@ nixl_status_t nixlPosixBackendReqH::initQueues() {
                 queue = QueueFactory::createAioQueue(queue_depth_, operation);
                 break;
             case nixlPosixQueue::queue_t::URING:
-                queue = QueueFactory::createUringQueue(queue_depth_, operation);
+                queue = QueueFactory::createUringQueue(queue_depth_, operation, custom_params_);
                 break;
             default:
                 NIXL_ERROR << absl::StrFormat("Invalid queue type: %s", queue_type_);
@@ -202,7 +194,7 @@ nixl_status_t nixlPosixBackendReqH::postXfer() {
 
 nixlPosixEngine::nixlPosixEngine(const nixlBackendInitParams* init_params)
     : nixlBackendEngine(init_params)
-    , queue_type_(getQueueType(init_params->customParams)) {
+    , queue_type_(getQueueType(*init_params->customParams)) {
     if (queue_type_ == nixlPosixQueue::queue_t::UNSUPPORTED) {
         initErr = true;
         NIXL_ERROR << absl::StrFormat("Failed to initialize POSIX backend - requested backend not available: %s",
@@ -226,33 +218,52 @@ nixl_status_t nixlPosixEngine::deregisterMem(nixlBackendMD *) {
     return NIXL_SUCCESS;
 }
 
+std::pair<nixl_status_t, const nixl_b_params_t> nixlPosixEngine::getQueueParams() const {
+    // Create a params map with our backend selection
+    nixl_b_params_t queue_params;
+    switch (queue_type_) {
+        case nixlPosixQueue::queue_t::AIO:
+            queue_params["use_aio"] = "true";
+            break;
+        case nixlPosixQueue::queue_t::URING:
+            queue_params["use_uring"] = "true";
+            break;
+        default:
+            NIXL_ERROR << absl::StrFormat("Invalid queue type: %s", queue_type_);
+            return std::make_pair(NIXL_ERR_INVALID_PARAM, nixl_b_params_t{});
+    }
+
+    std::string max_uring_depth_value;
+    if (getInitParam("max_uring_depth", max_uring_depth_value) == NIXL_SUCCESS) {
+        if (queue_type_ != nixlPosixQueue::queue_t::URING) {
+            NIXL_ERROR << "max_uring_depth is only supported for io_uring in POSIX backend";
+            return std::make_pair(NIXL_ERR_INVALID_PARAM, nixl_b_params_t{});
+        }
+        queue_params["max_uring_depth"] = max_uring_depth_value;
+    }
+
+    return std::make_pair(NIXL_SUCCESS, std::move(queue_params));
+}
+
+
 nixl_status_t nixlPosixEngine::prepXfer(const nixl_xfer_op_t &operation,
                                         const nixl_meta_dlist_t &local,
                                         const nixl_meta_dlist_t &remote,
                                         const std::string &remote_agent,
                                         nixlBackendReqH* &handle,
-                                        const nixl_opt_b_args_t* opt_args) const {
+                                        const nixl_opt_b_args_t*) const {
     if (!isValidPrepXferParams(operation, local, remote, remote_agent, localAgent)) {
         return NIXL_ERR_INVALID_PARAM;
     }
 
     try {
-        // Create a params map with our backend selection
-        nixl_b_params_t params;
-        switch (queue_type_) {
-            case nixlPosixQueue::queue_t::AIO:
-                params["use_aio"] = "true";
-                break;
-            case nixlPosixQueue::queue_t::URING:
-                params["use_uring"] = "true";
-                break;
-            default:
-                NIXL_ERROR << absl::StrFormat("Invalid queue type: %s", queue_type_);
-                return NIXL_ERR_INVALID_PARAM;
+        auto [status, queue_params] = getQueueParams();
+        if (status != NIXL_SUCCESS) {
+            return status;
         }
 
-        auto posix_handle = std::make_unique<nixlPosixBackendReqH>(operation, local, remote, opt_args, &params);
-        nixl_status_t status = posix_handle->prepXfer();
+        auto posix_handle = std::make_unique<nixlPosixBackendReqH>(operation, local, remote, queue_params);
+        status = posix_handle->prepXfer();
         if (status != NIXL_SUCCESS) {
             return status;
         }

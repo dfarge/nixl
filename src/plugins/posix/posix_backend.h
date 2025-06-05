@@ -20,6 +20,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 #include <absl/strings/str_format.h>
 #include "backend/backend_engine.h"
@@ -30,8 +31,7 @@ private:
     const nixl_xfer_op_t            &operation;      // The transfer operation (read/write)
     const nixl_meta_dlist_t         &local;          // Local memory descriptor list
     const nixl_meta_dlist_t         &remote;         // Remote memory descriptor list
-    const nixl_opt_b_args_t         *opt_args;       // Optional backend-specific arguments
-    const nixl_b_params_t           *custom_params_; // Custom backend parameters
+    const nixl_b_params_t           &custom_params_; // Custom backend parameters
     const int                       queue_depth_;    // Queue depth for async I/O
     std::unique_ptr<nixlPosixQueue> queue;           // Async I/O queue instance
     const nixlPosixQueue::queue_t   queue_type_;     // Type of queue used
@@ -42,8 +42,7 @@ public:
     nixlPosixBackendReqH(const nixl_xfer_op_t &operation,
                          const nixl_meta_dlist_t &local,
                          const nixl_meta_dlist_t &remote,
-                         const nixl_opt_b_args_t* opt_args,
-                         const nixl_b_params_t* custom_params);
+                         const nixl_b_params_t& queue_params);
     ~nixlPosixBackendReqH() {};
 
     nixl_status_t postXfer();
@@ -64,6 +63,8 @@ public:
 class nixlPosixEngine : public nixlBackendEngine {
 private:
     const nixlPosixQueue::queue_t queue_type_;
+
+    std::pair<nixl_status_t, const nixl_b_params_t> getQueueParams() const;
 
 public:
     nixlPosixEngine(const nixlBackendInitParams* init_params);

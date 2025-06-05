@@ -21,26 +21,30 @@
 #include <vector>
 #include <cstring>
 #include <stdexcept>
+#include <limits>
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "common/nixl_log.h"
 
-namespace {
-    // Log completion percentage at regular intervals (every log_percent_step percent)
-    void logOnPercentStep(unsigned int completed, unsigned int total) {
-        constexpr unsigned int log_percent_step = 10;
-        static_assert(log_percent_step >= 1 && log_percent_step <= 100, "log_percent_step must be in [1, 100]");
+//TODO REMOVE:
+#include <iostream>
 
-        if (total == 0) {
-            NIXL_ERROR << "Tried to log completion percentage with total == 0";
-            return;
-        }
-        // Only log at each percentage step
-        if (completed % (total / log_percent_step) == 0) {
-            NIXL_DEBUG << absl::StrFormat("Queue progress: %.1f%% complete",
-                                          (completed * 100.0 / total));
-        }
-    }
+namespace {
+    // // Log completion percentage at regular intervals (every log_percent_step percent)
+    // void logOnPercentStep(unsigned int completed, unsigned int total) {
+    //     constexpr unsigned int log_percent_step = 10;
+    //     static_assert(log_percent_step >= 1 && log_percent_step <= 100, "log_percent_step must be in [1, 100]");
+
+    //     if (total == 0) {
+    //         NIXL_ERROR << "Tried to log completion percentage with total == 0";
+    //         return;
+    //     }
+    //     // Only log at each percentage step
+    //     if (completed % (total / log_percent_step) == 0) {
+    //         NIXL_DEBUG << absl::StrFormat("Queue progress: %.1f%% complete",
+    //                                       (completed * 100.0 / total));
+    //     }
+    // }
 
     std::string stringifyUringFeatures(unsigned int features) {
         static const std::unordered_map<unsigned int, std::string> feature_map = {
@@ -60,38 +64,29 @@ namespace {
     }
 }
 
-nixl_status_t UringQueue::init(int entries, const io_uring_params& params) {
-    // Initialize with basic setup - need a mutable copy since the API modifies the params
-    io_uring_params mutable_params = params;
-    if (io_uring_queue_init_params(entries, &uring, &mutable_params) < 0) {
+// We pass a copy of the params to the Uring constructor because the io_uring_queue_init_params
+// function requires a mutable copy of the params
+Uring::Uring(int num_entries, io_uring_params params, io_uring_prep_func_t prep_op)
+    : num_entries(num_entries)
+    , num_completed(0)
+    , prep_op(prep_op)
+{
+    if (num_entries <= 0) {
+        throw std::invalid_argument("Invalid number of entries for Uring");
+    }
+
+    if (io_uring_queue_init_params(num_entries, &uring, &params) < 0) {
         throw std::runtime_error(absl::StrFormat("Failed to initialize io_uring instance: %s", strerror(errno)));
     }
 
-    // Log the features supported by this io_uring instance
-    NIXL_INFO << absl::StrFormat("io_uring features: %s", stringifyUringFeatures(mutable_params.features));
-
-    return NIXL_SUCCESS;
+    NIXL_INFO << absl::StrFormat("io_uring features: %s", stringifyUringFeatures(params.features));
 }
 
-UringQueue::UringQueue(int num_entries, const io_uring_params& params, nixl_xfer_op_t operation)
-    : num_entries(num_entries)
-    , num_completed(0)
-    , prep_op(operation == NIXL_READ ?
-        reinterpret_cast<io_uring_prep_func_t>(io_uring_prep_read) :
-        reinterpret_cast<io_uring_prep_func_t>(io_uring_prep_write))
-{
-    if (num_entries <= 0) {
-        throw std::invalid_argument("Invalid number of entries for UringQueue");
-    }
-
-    init(num_entries, params);
-}
-
-UringQueue::~UringQueue() {
+Uring::~Uring() {
     io_uring_queue_exit(&uring);
 }
 
-nixl_status_t UringQueue::submit() {
+nixl_status_t Uring::submit() {
     int ret = io_uring_submit(&uring);
     if (ret != num_entries) {
         if (ret < 0) {
@@ -105,7 +100,7 @@ nixl_status_t UringQueue::submit() {
     return NIXL_IN_PROG;
 }
 
-nixl_status_t UringQueue::checkCompleted() {
+nixl_status_t Uring::checkCompleted() {
     if (num_completed == num_entries) {
         return NIXL_SUCCESS;
     }
@@ -129,12 +124,10 @@ nixl_status_t UringQueue::checkCompleted() {
     io_uring_cq_advance(&uring, count);
     num_completed += count;
 
-    logOnPercentStep(num_completed, num_entries);
-
     return (num_completed == num_entries) ? NIXL_SUCCESS : NIXL_IN_PROG;
 }
 
-nixl_status_t UringQueue::prepIO(int fd, void* buf, size_t len, off_t offset) {
+nixl_status_t Uring::prepIO(int fd, void* buf, size_t len, off_t offset) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&uring);
     if (!sqe) {
         NIXL_ERROR << "Failed to get io_uring submission queue entry";
@@ -143,4 +136,62 @@ nixl_status_t UringQueue::prepIO(int fd, void* buf, size_t len, off_t offset) {
 
     prep_op(sqe, fd, buf, len, offset);
     return NIXL_SUCCESS;
+}
+
+UringQueue::UringQueue(const UringQueueParams& params) {
+    io_uring_prep_func_t prep_op = params.operation == NIXL_READ ?
+        reinterpret_cast<io_uring_prep_func_t>(io_uring_prep_read) :
+        reinterpret_cast<io_uring_prep_func_t>(io_uring_prep_write);
+
+    if (params.queue_params.count("max_uring_depth") > 0) {
+        max_uring_depth = std::stoul(params.queue_params.at("max_uring_depth"));
+    }
+
+    const size_t num_urings = (max_uring_depth == std::numeric_limits<size_t>::max()) 
+        ? 1  // Unlimited depth means we only need 1 uring
+        : (params.num_entries + max_uring_depth - 1) / max_uring_depth;
+
+    urings.reserve(num_urings);
+
+    size_t num_entries = params.num_entries;
+    while (num_entries > 0) {
+        size_t uring_num_entries = std::min(num_entries, max_uring_depth);
+        urings.emplace_back(std::make_unique<Uring>(uring_num_entries, params.uring_params, prep_op));
+        num_entries -= uring_num_entries;
+    }
+}
+
+nixl_status_t UringQueue::submit() {
+    for (auto& uring : urings) {
+        nixl_status_t status = uring->submit();
+        if (status != NIXL_IN_PROG) {
+            return status;
+        }
+    }
+    return NIXL_IN_PROG;
+}
+
+nixl_status_t UringQueue::checkCompleted() {
+    nixl_status_t status = NIXL_SUCCESS;
+    for (auto& uring : urings) {
+        nixl_status_t uring_status = uring->checkCompleted();
+        if (uring_status != NIXL_SUCCESS) {
+            if (uring_status == NIXL_IN_PROG) {
+                status = NIXL_IN_PROG;
+            } else {
+                return uring_status;
+            }
+        }
+    }
+    return status;
+}
+
+nixl_status_t UringQueue::prepIO(int fd, void* buf, size_t len, off_t offset) {
+    size_t uring_idx = num_submitted / max_uring_depth;
+
+    auto status = urings[uring_idx]->prepIO(fd, buf, len, offset);
+    if (status == NIXL_SUCCESS) {
+        num_submitted++;
+    }
+    return status;
 }

@@ -41,12 +41,18 @@ namespace {
 
     template <typename Mode>
     struct funcImpl<Mode, std::enable_if_t<std::is_same<Mode, uringEnabled>::value>> {
-        static std::unique_ptr<nixlPosixQueue> createUringQueue(int num_entries, nixl_xfer_op_t operation) {
+        static std::unique_ptr<nixlPosixQueue> createUringQueue(int num_entries, nixl_xfer_op_t operation, const nixl_b_params_t& queue_params) {
             // Initialize io_uring parameters with basic configuration
             // Start with basic parameters, no special flags
             // We can add optimizations like SQPOLL later
-            struct io_uring_params params = {};
-            return std::make_unique<class UringQueue>(num_entries, params, operation);
+            UringQueueParams uq_params{
+                .num_entries = num_entries,
+                .uring_params = {},
+                .operation = operation,
+                .queue_params = queue_params
+            };
+                
+            return std::make_unique<class UringQueue>(uq_params);
         }
 
         static bool isUringAvailable() {
@@ -56,9 +62,10 @@ namespace {
 
     template <typename Mode>
     struct funcImpl<Mode, std::enable_if_t<std::is_same<Mode, uringDisabled>::value>> {
-        static std::unique_ptr<nixlPosixQueue> createUringQueue(int num_entries, nixl_xfer_op_t operation) {
+        static std::unique_ptr<nixlPosixQueue> createUringQueue(int num_entries, nixl_xfer_op_t operation, const nixl_b_params_t& queue_params) {
             (void)num_entries;
             (void)operation;
+            (void)queue_params;
             throw nixlPosixBackendReqH::exception("Attempting to create io_uring queue when support is not compiled in",
                                                   NIXL_ERR_NOT_SUPPORTED);
         }
@@ -74,8 +81,8 @@ std::unique_ptr<nixlPosixQueue> QueueFactory::createAioQueue(int num_entries, ni
     return std::make_unique<aioQueue>(num_entries, operation);
 }
 
-std::unique_ptr<nixlPosixQueue> QueueFactory::createUringQueue(int num_entries, nixl_xfer_op_t operation) {
-    return funcImpl<uringMode>::createUringQueue(num_entries, operation);
+std::unique_ptr<nixlPosixQueue> QueueFactory::createUringQueue(int num_entries, nixl_xfer_op_t operation, const nixl_b_params_t& queue_params) {
+    return funcImpl<uringMode>::createUringQueue(num_entries, operation, queue_params);
 }
 
 bool QueueFactory::isUringAvailable() {

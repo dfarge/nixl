@@ -197,9 +197,10 @@ int main(int argc, char *argv[])
     std::string        test_files_dir_path = default_test_files_dir_path;
     bool               use_direct_io = false;  // New option for O_DIRECT
     bool               use_uring = false;      // New option for io_uring
+    size_t             max_uring_depth = 0;    // Max uring depth (0 = use default)
     long               page_size = sysconf(_SC_PAGESIZE);
 
-    while ((opt = getopt(argc, argv, "n:s:d:DUh")) != -1) {
+    while ((opt = getopt(argc, argv, "n:s:d:m:DUh")) != -1) {
         switch (opt) {
             case 'n':
                 num_transfers = std::stoi(optarg);
@@ -210,6 +211,9 @@ int main(int argc, char *argv[])
             case 'd':
                 test_files_dir_path = optarg;
                 break;
+            case 'm':
+                max_uring_depth = std::stoull(optarg);
+                break;
             case 'D':
                 use_direct_io = true;
                 break;
@@ -218,10 +222,11 @@ int main(int argc, char *argv[])
                 break;
             case 'h':
             default:
-                std::cout << absl::StrFormat("Usage: %s [-n num_transfers] [-s transfer_size] [-d test_files_dir_path] [-D] [-U]", argv[0]) << std::endl;
+                std::cout << absl::StrFormat("Usage: %s [-n num_transfers] [-s transfer_size] [-d test_files_dir_path] [-m max_uring_depth] [-D] [-U]", argv[0]) << std::endl;
                 std::cout << absl::StrFormat("  -n num_transfers      Number of transfers (default: %d)", default_num_transfers) << std::endl;
                 std::cout << absl::StrFormat("  -s transfer_size      Size of each transfer in bytes (default: %zu)", default_transfer_size) << std::endl;
                 std::cout << absl::StrFormat("  -d test_files_dir_path Directory for test files, strongly recommended to use nvme device (default: %s)", default_test_files_dir_path) << std::endl;
+                std::cout << absl::StrFormat("  -m max_uring_depth    Maximum uring depth (0 = use default - unlimited, only applies to io_uring backend)") << std::endl;
                 std::cout << absl::StrFormat("  -D                    Use O_DIRECT for file I/O") << std::endl;
                 std::cout << absl::StrFormat("  -U                    Use io_uring backend instead of AIO") << std::endl;
                 std::cout << absl::StrFormat("  -h                    Show this help message") << std::endl;
@@ -266,6 +271,10 @@ int main(int argc, char *argv[])
         params["use_direct_io"] = "true";
     }
 
+    if (max_uring_depth > 0) {
+        params["max_uring_depth"] = std::to_string(max_uring_depth);
+    }
+
     // Print test configuration information
     print_segment_title("NIXL STORAGE TEST STARTING (POSIX PLUGIN)");
     std::cout << absl::StrFormat("Configuration:\n");
@@ -274,6 +283,9 @@ int main(int argc, char *argv[])
     std::cout << absl::StrFormat("- Total data: %.2f GB\n", (float(transfer_size) * num_transfers) / gb_size);
     std::cout << absl::StrFormat("- Directory: %s\n", abs_path);
     std::cout << absl::StrFormat("- Backend: %s\n", use_uring ? "io_uring" : "AIO");
+    if (use_uring && max_uring_depth > 0) {
+        std::cout << absl::StrFormat("- Max uring depth: %zu\n", max_uring_depth);
+    }
     std::cout << absl::StrFormat("- Direct I/O: %s\n", use_direct_io ? "enabled" : "disabled");
     std::cout << std::endl;
     std::cout << line_str << std::endl;
