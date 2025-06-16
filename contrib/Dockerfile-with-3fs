@@ -1,0 +1,236 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+ARG BASE_IMAGE="nvcr.io/nvidia/cuda-dl-base"
+ARG BASE_IMAGE_TAG="25.03-cuda12.8-devel-ubuntu24.04"
+
+FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG}
+
+ARG ARCH="x86_64"
+ARG DEFAULT_PYTHON_VERSION="3.12"
+ARG UCX_REF="v1.19.x"
+
+# Install base build dependencies including 3FS requirements
+RUN apt-get update -y && \
+    DEBIAN_FRONTEND=noninteractive apt-get -y install \
+    ninja-build \
+    pybind11-dev \
+    libclang-dev \
+    cmake \
+    libgflags-dev \
+    libgrpc-dev \
+    libgrpc++-dev \
+    libprotobuf-dev \
+    libaio-dev \
+    liburing-dev \
+    protobuf-compiler-grpc \
+    libcpprest-dev \
+    etcd-server \
+    etcd-client \
+    autotools-dev \
+    automake \
+    libtool \
+    libz-dev \
+    flex \
+    libgtest-dev \
+    build-essential \
+    # Additional dependencies for 3FS
+    libuv1-dev \
+    liblz4-dev \
+    liblzma-dev \
+    libdouble-conversion-dev \
+    libdwarf-dev \
+    libunwind-dev \
+    libgoogle-glog-dev \
+    libgmock-dev \
+    clang-format-14 \
+    clang-14 \
+    clang-tidy-14 \
+    lld-14 \
+    libgoogle-perftools-dev \
+    google-perftools \
+    libssl-dev \
+    gcc-12 \
+    g++-12 \
+    libboost-all-dev \
+    git \
+    wget \
+    meson \
+    curl
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get -y install \
+    --reinstall libibverbs-dev rdma-core ibverbs-utils libibumad-dev \
+    libnuma-dev librdmacm-dev ibverbs-providers
+
+WORKDIR /workspace
+RUN git clone https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git &&\
+	cd etcd-cpp-apiv3 && mkdir build && cd build && \
+	cmake .. && make -j$(nproc) && make install
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    RUST_VERSION=1.86.0 \
+    RUSTARCH=${ARCH}-unknown-linux-gnu
+
+# Download rustup-init and its checksum for the target architecture
+RUN wget --tries=3 --waitretry=5 \
+    "https://static.rust-lang.org/rustup/archive/1.28.1/${RUSTARCH}/rustup-init" \
+    "https://static.rust-lang.org/rustup/archive/1.28.1/${RUSTARCH}/rustup-init.sha256" && \
+    sha256sum -c rustup-init.sha256 && \
+    chmod +x rustup-init && \
+    ./rustup-init -y --no-modify-path --profile minimal --default-toolchain $RUST_VERSION --default-host ${RUSTARCH} && \
+    rm rustup-init* && \
+    chmod -R a+w $RUSTUP_HOME $CARGO_HOME
+
+# Install FoundationDB for 3FS
+RUN cd /tmp && \
+    wget -q https://github.com/apple/foundationdb/releases/download/7.1.67/foundationdb-server_7.1.67-1_amd64.deb \
+         https://github.com/apple/foundationdb/releases/download/7.1.67/foundationdb-clients_7.1.67-1_amd64.deb && \
+    dpkg -i foundationdb-server_7.1.67-1_amd64.deb foundationdb-clients_7.1.67-1_amd64.deb && \
+    rm -f foundationdb-*.deb
+
+# Build and install FUSE 3.16.2 for 3FS
+RUN cd /tmp && \
+    wget -q https://github.com/libfuse/libfuse/releases/download/fuse-3.16.2/fuse-3.16.2.tar.gz && \
+    tar -zxf fuse-3.16.2.tar.gz && \
+    cd fuse-3.16.2 && \
+    mkdir build && cd build && \
+    meson setup .. && \
+    ninja && \
+    ninja install && \
+    cd /tmp && rm -rf fuse-3.16.2*
+
+# Clone and build 3FS
+RUN cd /workspace && \
+    git clone https://github.com/deepseek-ai/3fs && \
+    cd 3fs && \
+    git submodule update --init --recursive && \
+    ./patches/apply.sh && \
+    cmake -S . -B build \
+        -DCMAKE_CXX_COMPILER=clang++-14 \
+        -DCMAKE_C_COMPILER=clang-14 \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON && \
+    cmake --build build -j$(nproc) && \
+    # Install 3FS binaries to /usr/local/bin for system-wide access
+    cp build/bin/* /usr/local/bin/ && \
+    # Create 3FS configuration directory
+    mkdir -p /etc/3fs
+
+WORKDIR /workspace/nixl
+COPY . /workspace/nixl
+
+# LD_LIBRARY_PATH is needed for auditwheel to find libcuda.so.1
+# Set incorrectly to `compat/lib` in cuda-dl-base image
+ENV LD_LIBRARY_PATH=/usr/local/cuda/compat/lib.real:/usr/local/lib:$LD_LIBRARY_PATH
+
+ENV VIRTUAL_ENV=/workspace/nixl/.venv
+RUN uv venv $VIRTUAL_ENV --python $DEFAULT_PYTHON_VERSION && \
+    # pybind11 pip install needed for ubuntu 22.04
+    uv pip install --upgrade meson pybind11 patchelf
+
+    # Add Mellanox repository and install packages
+RUN ARCH_SUFFIX=$(if [ "${ARCH}" = "aarch64" ]; then echo "arm64-sbsa"; else echo "${ARCH}"; fi) && \
+    export PKG_CONFIG_PATH="/opt/mellanox/doca/lib/${ARCH_SUFFIX}-linux-gnu/pkgconfig:/opt/mellanox/dpdk/lib/${ARCH_SUFFIX}-linux-gnu/pkgconfig:$PKG_CONFIG_PATH" && \
+    curl -fsSL https://linux.mellanox.com/public/repo/doca/3.0.0/ubuntu24.04/${ARCH_SUFFIX}/GPG-KEY-Mellanox.pub | \
+    gpg --dearmor | tee /usr/share/keyrings/mellanox-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/mellanox-archive-keyring.gpg] https://linux.mellanox.com/public/repo/doca/3.0.0/ubuntu24.04/${ARCH_SUFFIX} ./" | \
+    tee /etc/apt/sources.list.d/mellanox.list && \
+    DEBIAN_FRONTEND=noninteractive apt update -y && \
+    apt install -y --no-install-recommends \
+        mlnx-dpdk mlnx-dpdk-dev \
+        doca-sdk-common doca-sdk-dma doca-sdk-dpdk-bridge \
+        doca-sdk-eth doca-sdk-flow doca-sdk-rdma doca-all \
+        doca-sdk-gpunetio libdoca-sdk-gpunetio-dev
+
+RUN rm -rf /usr/lib/ucx
+RUN rm -rf /opt/hpcx/ucx
+
+RUN cd /usr/local/src && \
+     git clone https://github.com/openucx/ucx.git && \
+     cd ucx && 			     \
+     git checkout $UCX_REF &&        \
+     ./autogen.sh && ./configure     \
+         --enable-shared             \
+         --disable-static            \
+         --disable-doxygen-doc       \
+         --enable-optimizations      \
+         --enable-cma                \
+         --enable-devel-headers      \
+         --with-cuda=/usr/local/cuda \
+         --with-verbs                \
+         --with-dm                   \
+         --with-gdrcopy=/usr/local   \
+         --with-efa                  \
+         --enable-mt &&              \
+     make -j &&                      \
+     make -j install-strip &&        \
+     ldconfig
+
+
+RUN rm -rf build && \
+    mkdir build && \
+    uv run meson setup build/ --prefix=/usr/local/nixl && \
+    cd build && \
+    ninja && \
+    ninja install
+
+ENV NIXL_PREFIX=/usr/local/nixl
+ENV NIXL_PLUGIN_DIR=/usr/local/nixl/lib/$ARCH-linux-gnu/plugins
+RUN echo "/usr/local/nixl/lib/$ARCH-linux-gnu" > /etc/ld.so.conf.d/nixl.conf && \
+    echo "/usr/local/nixl/lib/$ARCH-linux-gnu/plugins" >> /etc/ld.so.conf.d/nixl.conf && \
+    ldconfig
+
+RUN cd src/bindings/rust && cargo build --release --locked
+
+# Create the wheel
+ARG WHL_PYTHON_VERSIONS="3.12"
+ARG WHL_PLATFORM="manylinux_2_39_$ARCH"
+RUN IFS=',' read -ra PYTHON_VERSIONS <<< "$WHL_PYTHON_VERSIONS" && \
+    for PYTHON_VERSION in "${PYTHON_VERSIONS[@]}"; do \
+        uv build --wheel --out-dir /tmp/dist --python $PYTHON_VERSION; \
+    done
+RUN uv pip install auditwheel && \
+    uv run auditwheel repair /tmp/dist/nixl-*cp31*.whl --plat $WHL_PLATFORM --wheel-dir /workspace/nixl/dist
+
+RUN uv pip install dist/nixl-*cp${DEFAULT_PYTHON_VERSION//./}*.whl
+
+# Add 3FS binaries to PATH and create convenient aliases
+ENV PATH="/usr/local/bin:$PATH"
+
+# Create a simple script to show available 3FS commands
+RUN echo '#!/bin/bash' > /usr/local/bin/3fs-info && \
+    echo 'echo "Available 3FS binaries:"' >> /usr/local/bin/3fs-info && \
+    echo 'echo "  admin_cli          - Administrative CLI tool"' >> /usr/local/bin/3fs-info && \
+    echo 'echo "  hf3fs-admin        - HF3FS admin tool"' >> /usr/local/bin/3fs-info && \
+    echo 'echo "  hf3fs_fuse_main    - FUSE main binary for mounting"' >> /usr/local/bin/3fs-info && \
+    echo 'echo "  meta_main          - Metadata server"' >> /usr/local/bin/3fs-info && \
+    echo 'echo "  mgmtd_main         - Management daemon"' >> /usr/local/bin/3fs-info && \
+    echo 'echo "  migration_main     - Migration tool"' >> /usr/local/bin/3fs-info && \
+    echo 'echo "  monitor_collector_main - Monitoring collector"' >> /usr/local/bin/3fs-info && \
+    echo 'echo "  simple_example_main    - Simple example application"' >> /usr/local/bin/3fs-info && \
+    echo 'echo "  storage_bench      - Storage benchmarking tool"' >> /usr/local/bin/3fs-info && \
+    echo 'echo "  storage_main       - Storage server"' >> /usr/local/bin/3fs-info && \
+    echo 'echo ""' >> /usr/local/bin/3fs-info && \
+    echo 'echo "Use 3fs-info to see this list anytime"' >> /usr/local/bin/3fs-info && \
+    chmod +x /usr/local/bin/3fs-info
+
+# Show 3FS build info
+RUN echo "3FS build completed successfully!" && \
+    echo "Built binaries:" && \
+    ls -lh /usr/local/bin/{admin_cli,hf3fs-admin,hf3fs_fuse_main,meta_main,mgmtd_main,migration_main,monitor_collector_main,simple_example_main,storage_bench,storage_main} 2>/dev/null || true 
