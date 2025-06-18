@@ -13,9 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG BASE_IMAGE="nvcr.io/nvidia/cuda-dl-base"
-ARG BASE_IMAGE_TAG="25.03-cuda12.8-devel-ubuntu24.04"
-
+ARG BASE_IMAGE="nvcr.io/nvidia/pytorch"
+ARG BASE_IMAGE_TAG="24.10-py3"
 FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG}
 
 ARG ARCH="x86_64"
